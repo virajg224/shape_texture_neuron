@@ -4,6 +4,7 @@ import os.path
 import os
 import click
 import yaml
+import argparse
 from addict import Dict
 from tqdm import tqdm
 import json
@@ -21,6 +22,59 @@ from libs.utils.loss import CrossEntropyLoss2d
 from libs.utils.metric import *
 from libs.utils.utils import *
 from libs.models.deeplab_imagenet import torchutils
+
+parser = argparse.ArgumentParser()
+
+# Model settings
+parser.add_argument('--texture_resolution', type=int, default=512)
+parser.add_argument('--mesh_resolution', type=int, default=32)
+parser.add_argument('--symmetric_g', type=bool, default=True)
+parser.add_argument('--texture_only', action='store_true')
+parser.add_argument('--conditional_class', default="--conditional_class", action='store_true', help='condition the model on class labels')
+parser.add_argument('--conditional_color', action='store_true', help='condition the model on colors (p3d only)')
+parser.add_argument('--conditional_text', action='store_true', help='condition the model on captions (cub only)')
+parser.add_argument('--norm_g', type=str, default='syncbatch', help='(syncbatch|batch|instance|none)')
+parser.add_argument('--latent_dim', type=int, default=64, help='dimensionality of the random vector z')
+parser.add_argument('--mesh_path', type=str, default='autodetect', help='path to the .obj mesh template')
+
+parser.add_argument('--text_max_length', type=int, default=18)
+parser.add_argument('--text_pretrained_encoder', type=str, default='cache/cub/text_encoder200.pth')
+parser.add_argument('--text_train_encoder', action='store_true') # Disabled by default (unstable)
+parser.add_argument('--text_attention', type=bool, default=True)
+parser.add_argument('--text_embedding_dim', type=int, default=256)
+
+# Training settings
+parser.add_argument('--epochs', type=int, default=600)
+parser.add_argument('--norm_d', type=str, default='none', help='(instance|none)')
+parser.add_argument('--mesh_regularization', type=float, default=0.0001, help='strength of the smoothness regularizer')
+parser.add_argument('--lr_g', type=float, default=0.0001)
+parser.add_argument('--lr_d', type=float, default=0.0004)
+parser.add_argument('--d_steps_per_g', type=int, default=2)
+parser.add_argument('--g_running_average_alpha', type=float, default=0.999)
+parser.add_argument('--lr_decay_after', type=int, default=1000) # Set to a very large value to disable
+parser.add_argument('--loss', type=str, default='hinge', help='(hinge|ls|original)')
+parser.add_argument('--mask_output', type=bool, default=True)
+parser.add_argument('--num_discriminators', type=int, default=-1) # -1 = autodetect
+
+# Session settings
+parser.add_argument('--weights', type=str, required=True)
+parser.add_argument('--dataset', type=str, required=True, help='(p3d|cub)')
+parser.add_argument('--config', type=str, required=True)
+parser.add_argument('--run', type=str, required=True)
+parser.add_argument('--checkpoint_freq', type=int, default=20, help='save checkpoint every N epochs')
+parser.add_argument('--save_freq', type=int, default=5, help='save latest checkpoint every N epochs')
+parser.add_argument('--evaluate_freq', type=int, default=20, help='evaluate FID every N epochs')
+parser.add_argument('--tensorboard', action='store_true')
+parser.add_argument('--gpu_ids', type=str, default='0', help='comma-separated')
+parser.add_argument('--continue_train', action='store_true', help='resume training from checkpoint')
+parser.add_argument('--evaluate', action='store_true', help='evaluate FID, do not train')
+parser.add_argument('--save_results', action='store_true', help='export image/mesh samples, do not train')
+parser.add_argument('--which_epoch', type=str, default='latest', help='(N|latest|best)') # Epoch from which to resume (or evaluate)
+parser.add_argument('--batch_size', type=int, default=32)
+parser.add_argument('--num_workers', type=int, default=4, help='number of data-loading threads')
+parser.add_argument('--truncation_sigma', type=float, default=-1, help='-1 = autodetect; set to a large value to disable')
+
+args = parser.parse_args()
 
 cudnn.benchmark = True
 manual_seed = 627937
@@ -48,11 +102,9 @@ def check_grad(model):
             print('\nparam name: ' + n + ' requires_grad: ' + str(p.requires_grad) + '  grad: ' + str(type(p.grad)))
     return
 
-
-@click.command()
-@click.option('--config', '-c', type=str, required=True)
-@click.option('--run', '-r', type=str, required=True, help='use any of  trainval,train,val')
-def main(config, run):
+def main():
+    config = args.config
+    run= args.run
     CONFIG = Dict(yaml.load(open(config)))
     if not run in ['trainval', 'train', 'val']:
         raise ValueError('run can have values: trainval/train/val')
@@ -97,10 +149,11 @@ def main(config, run):
 
     # Dataset
     if run in ['trainval', 'train']:
-        train_dataset = datasets.get_train_dataset(CONFIG)  # ,p_split='trainval')
-        print('train_dataset len: ' + str(train_dataset.__len__()))
+        from data.pascal3d_plus_dataset import Pascal3DPlusDataset
+        train_ds = Pascal3DPlusDataset(args)
+        print('train_dataset len: ' + str(train_ds.__len__()))
         train_loader = torch.utils.data.DataLoader(
-            dataset=train_dataset,
+            dataset=train_ds,
             batch_size=CONFIG.BATCH_SIZE.TRAIN,
             num_workers=CONFIG.NUM_WORKERS,
             shuffle=True
